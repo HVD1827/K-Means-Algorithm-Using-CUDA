@@ -1,0 +1,495 @@
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <fstream>
+#include <limits>
+#include <random>
+#include <numeric>
+#include <cuda_runtime.h>
+#include <set>
+#include <curand.h>
+#include <curand_kernel.h>
+
+#include <cub/cub.cuh>
+
+using namespace std;
+
+#define PRINT_CENTROIDS                                                                           \
+    cudaMemcpy(print_h_centroid_help, d_centroids, k *d * sizeof(float), cudaMemcpyDeviceToHost); \
+    cout << "Initial centroids:" << endl;                                                         \
+    for (int i = 0; i < k; ++i)                                                                   \
+    {                                                                                             \
+        for (int j = 0; j < d; ++j)                                                               \
+        {                                                                                         \
+            cout << h_centroids[i * d + j] << " ";                                                \
+        }                                                                                         \
+        cout << endl;                                                                             \
+    }
+
+#define ERROR(n)                                                    \
+    e = cudaGetLastError();                                         \
+    if (e != cudaSuccess)                                           \
+    {                                                               \
+        fprintf(stderr, "Error:%d %s\n", n, cudaGetErrorString(e)); \
+        exit(EXIT_FAILURE);                                         \
+    }
+
+int N, d, k, max_iters = 1000;
+float *d_data, *d_centroids, *d_distances, *d_min_distances;
+int *d_labels_odd, *d_labels_even;
+int *d_flag;
+
+__global__ void setup_curand_states(curandState *states, unsigned long seed, int N)
+{
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx >= N)
+        return;
+    curand_init(seed, idx, 0, &states[idx]); // Initialize CURAND
+}
+
+__global__ void compute_distances(float *data, float *centroids,
+                                  float *distances, int N, int d, int k)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * k)
+        return;
+
+    int point_idx = idx / k;
+    int centroid_idx = idx % k;
+
+    float sum = 0.0f;
+    for (int i = 0; i < d; ++i)
+    {
+        float diff = data[point_idx * d + i] - centroids[centroid_idx * d + i];
+        sum += diff * diff;
+    }
+    distances[idx] = sum;
+}
+
+__global__ void compute_distances_kmp(float *data,
+                                      float *distances, int *centroid_set, int N, int d, int size, int k)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * size)
+        return;
+
+    int point_idx = idx / size;
+    int centroid_idx = centroid_set[idx % size];
+
+    float sum = 0.0f;
+    for (int i = 0; i < d; ++i)
+    {
+        float diff = data[point_idx * d + i] - data[centroid_idx * d + i];
+        sum += diff * diff;
+    }
+    distances[(k * point_idx) + (idx % size)] = sum;
+}
+
+__global__ void assign_clusters(float *distances, int *labels,
+                                float *min_distances, int size, int N, int k)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N)
+        return;
+
+    float minm_dist = distances[idx * k];
+    int minm_index = 0;
+
+    for (int j = 1; j < size; ++j)
+    {
+        float dist = distances[idx * k + j];
+        if (dist < minm_dist)
+        {
+            minm_dist = dist;
+            minm_index = j;
+        }
+    }
+
+    labels[idx] = minm_index;
+    min_distances[idx] = minm_dist;
+}
+
+__global__ void update_centroids(float *data, int *labels,
+                                 float *centroids, int *counts,
+                                 int N, int d, int k)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N * d)
+        return;
+
+    int point_idx = idx / d;
+    int dim_idx = idx % d;
+    int cluster = labels[point_idx];
+
+    atomicAdd(&centroids[cluster * d + dim_idx], data[point_idx * d + dim_idx]);
+    if (dim_idx == 0)
+    {
+        atomicAdd(&counts[cluster], 1);
+    }
+}
+
+__global__ void normalize_centroids(float *centroids, int *counts,
+                                    int d, int k)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= k * d)
+        return;
+
+    int cluster = idx / d;
+    int dim = idx % d;
+
+    if (counts[cluster] > 0)
+    {
+        centroids[cluster * d + dim] /= counts[cluster];
+    }
+}
+
+__global__ void detect_change(int *d_labels_even, int *d_labels_odd, int N, int *d_flag)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N)
+        return;
+
+    if (*d_flag == 1)
+        return;
+
+    if (d_labels_even[idx] != d_labels_odd[idx])
+    {
+        atomicExch(d_flag, 1);
+    }
+}
+
+__global__ void compute_probabs(float *min_distances,
+                                float *probabilities,
+                                float *total_cost,
+                                int *centroid_set,
+                                int *centroid_count,
+                                curandState *states,
+                                int l, int N)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N)
+        return;
+
+    float val = (float)l * (min_distances[idx] / (float)*total_cost);
+    probabilities[idx] = val;
+
+    // for checking if we should add it in the set
+    float probab_random = curand_uniform(&states[idx]);
+    if (probab_random < val)
+    {
+        int index = atomicInc((unsigned int *)centroid_count, INT_MAX);
+        centroid_set[index] = idx;
+        // can't avoid atomics ig. try if possible.
+        // centroid_set[idx] = 1;
+    }
+}
+
+// Optimized reduction-based compute_total_cost kernel
+// __global__ void compute_total_cost(float *min_distances, float *total_cost, int N)
+// {
+//     extern __shared__ float shmem[];
+//     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+//     if (i < N)
+//     {
+//         shmem[threadIdx.x] = min_distances[i];
+//     }
+//     else
+//     {
+//         shmem[threadIdx.x] = 0.0f;
+//     }
+
+//     __syncthreads();
+
+//     for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1)
+//     {
+//         if (threadIdx.x < s)
+//         {
+//             shmem[threadIdx.x] += shmem[threadIdx.x + s];
+//         }
+//         __syncthreads();
+//     }
+
+//     if (threadIdx.x == 0)
+//     {
+//         atomicAdd(total_cost, shmem[0]);
+//     }
+// }
+
+void compute_total_cost(float *min_distances, float *total_cost, int N)
+{
+    void *d_temp_storage = nullptr;
+    size_t temp_storage_bytes = 0;
+    cub::DeviceReduce::Sum(d_temp_storage, temp_storage_bytes,
+                           min_distances, total_cost, N);
+
+    cudaMalloc(&d_temp_storage, temp_storage_bytes);
+
+    cub::DeviceReduce::Sum(d_temp_storage, temp_storage_bytes,
+                           min_distances, total_cost, N);
+
+    cudaFree(d_temp_storage);
+}
+
+__global__ void assign_centroids(float *data, float *centroids, int d, int centroid_indx, int point_indx)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= d)
+        return;
+    centroids[(centroid_indx * d) + idx] = data[(point_indx * d) + idx];
+}
+
+int main()
+{
+    cudaError_t e = cudaGetLastError();
+
+    ifstream infile("input2.txt");
+    infile >> N >> d >> k;
+
+    float *print_h_centroid_help = new float[k * d];
+
+    float data_arr[N * d];
+    for (int i = 0; i < N; ++i)
+    {
+        for (int j = 0; j < d; ++j)
+        {
+            float val;
+            infile >> val;
+            data_arr[i * d + j] = val;
+        }
+    }
+
+    cudaMalloc(&d_data, N * d * sizeof(float));
+    cudaMemcpy(d_data, data_arr, N * d * sizeof(float), cudaMemcpyHostToDevice);
+
+    int *counts;
+    cudaMalloc(&counts, k * sizeof(int));
+
+    int *d_labels;
+    cudaMalloc(&d_labels, N * sizeof(int));
+
+    cudaMalloc(&d_centroids, k * d * sizeof(float));
+    cudaMalloc(&d_distances, N * k * sizeof(float));
+    cudaMalloc(&d_min_distances, N * sizeof(float));
+
+    cudaMalloc(&d_labels_odd, N * sizeof(int));
+    cudaMalloc(&d_labels_even, N * sizeof(int));
+
+    cudaMalloc(&d_flag, sizeof(int));
+    cudaMemset(d_flag, 0, sizeof(int));
+
+    /////////////////////////// KMEANS PARALLEL INIT./////////
+    int l_kmp = 5;
+    int rounds = 200; // default, will break if k centroids are found, not more than this
+
+    int first_center_idx = 0; // initialise the frst center randomly to the first point(bcz it is random)
+    cudaMemcpy(d_centroids, &data_arr[first_center_idx * d], d * sizeof(float), cudaMemcpyHostToDevice);
+
+    float *d_probabs;
+    cudaMalloc(&d_probabs, N * sizeof(float));
+    // float *h_probabs = new float[N];
+
+    set<int> C_indices_kmp;
+    C_indices_kmp.insert(first_center_idx);
+
+    float *d_total_cost;
+    cudaMalloc(&d_total_cost, sizeof(float));
+    int size;
+
+    int *d_centroid_set;
+    cudaMalloc(&d_centroid_set, (k + (2 * l_kmp)) * sizeof(int));
+    // cudaMemset(d_centroid_set, 1, sizeof(int)); doesnt work, use memcpy ;/ this is because it sets bytes not the specified size
+    cudaMemset(d_centroid_set, 0, (k + (2 * l_kmp)) * sizeof(int));
+    int val = 0;
+    cudaMemcpy(d_centroid_set, &val, sizeof(int), cudaMemcpyHostToDevice);
+
+    // int *h1 = new int[N];
+    // cudaMemcpy(h1, d_centroid_set, N * sizeof(int), cudaMemcpyDeviceToHost);
+    // for (int i = 0; i < N; ++i)
+    // {
+    //     cout << h1[i] << " ";
+    // }
+    // cout << endl;
+    int *d_centroid_count;
+    cudaMalloc(&d_centroid_count, sizeof(int));
+    val = 1;
+    cudaMemcpy(d_centroid_count, &val, sizeof(int), cudaMemcpyHostToDevice);
+
+    curandState *d_states;
+    cudaMalloc(&d_states, N * sizeof(curandState));
+    setup_curand_states<<<(N + 255) / 256, 256>>>(d_states, 2025, N);
+
+    float *d_distances_kmp;
+    cudaMalloc(&d_distances_kmp, N * k * sizeof(float));
+    cudaMemset(d_distances_kmp, 0, N * k * sizeof(float));
+
+    for (int r = 0; r < rounds; ++r)
+    {
+        // cout << "Round " << r + 1 << endl;
+        // distances to nearest cntroid or Dsq.
+        // size = C_indices_kmp.size();
+        cudaMemcpy(&size, d_centroid_count, sizeof(int), cudaMemcpyDeviceToHost);
+        // cout << "Current centroid count: " << size << endl;
+        if (size >= k)
+        {
+            // cout << "k centroids done, breaking" << endl;
+            cout << "rounds done " << r << endl;
+            break;
+        }
+        compute_distances_kmp<<<((N * (size)) + 255) / 256, 256>>>(d_data, d_distances_kmp, d_centroid_set, N, d, size, k);
+        // float *h_distances_kmp = new float[N * size];
+        // cudaMemcpy(h_distances_kmp, d_distances_kmp, N * size * sizeof(float), cudaMemcpyDeviceToHost);
+        // for (int i = 0; i < size; i++)
+        // {
+        //     cout << "Centroid number " << i << " : ";
+        //     for (int j = 0; j < N; j++)
+        //     {
+        //         cout << h_distances_kmp[i * N + j] << " ";
+        //     }
+        //     cout << endl;
+        // }
+
+        ERROR(1);
+        cudaDeviceSynchronize();
+
+        // nearest centroid assignment
+
+        assign_clusters<<<(N + 255) / 256, 256>>>(
+            d_distances_kmp, d_labels, d_min_distances, size, N, k);
+        ERROR(2);
+        cudaDeviceSynchronize();
+        // float *h_min_distances = new float[N];
+        // cudaMemcpy(h_min_distances, d_min_distances, N * sizeof(float), cudaMemcpyDeviceToHost);
+        // for (int i = 0; i < N; i++)
+        // {
+        //     cout << "Point number " << i << " : ";
+        //     cout << h_min_distances[i] << endl;
+        // }
+
+        // compute probabs
+        cudaMemset(d_total_cost, 0, sizeof(float));
+        compute_total_cost(d_min_distances, d_total_cost, N);
+
+        // float *tot_cst = new float[1];
+        // cudaMemcpy(tot_cst, d_total_cost, sizeof(float), cudaMemcpyDeviceToHost);
+        // cout << "tot_cst " << *tot_cst << endl;
+
+        ERROR(3);
+        cudaDeviceSynchronize();
+
+        compute_probabs<<<((N) + 255) / 256, 256>>>(d_min_distances, d_probabs, d_total_cost, d_centroid_set, d_centroid_count, d_states, l_kmp, N);
+        ERROR(4);
+        cudaDeviceSynchronize();
+
+        // float *h_probabs = new float[N];
+        // cudaMemcpy(h_probabs, d_probabs, N * sizeof(float), cudaMemcpyDeviceToHost);
+        // for (int i = 0; i < N; ++i)
+        // {
+        //     cout << h_probabs[i] << endl;
+        // }
+        //////// the above part is bad, sequential code on the CPU is the bottlneck //////////////
+        // possible options: launch a kernel to do this, maintaining the count and an array for this -- looks good, consider all the limitations
+        // merge with the compute_probabs kernel onlyy
+    }
+
+    // we have now more thann k points, reduce it ko k, but how?
+    // one way is to weigh them according to
+    // int *h = new int[N];
+    // cudaMemcpy(h, d_centroid_set, N * sizeof(int), cudaMemcpyDeviceToHost);
+    // int count = 0;
+    // for (int i = 0; i < N; i++)
+    // {
+    //     if (count == k)
+    //         break;
+    //     if (h[i])
+    //     {
+    //         assign_centroids<<<(d + 255) / 256, 256>>>(d_data, d_centroids, d, count, i);
+    //         count++;
+    //     }
+    // }
+
+    int *h_centroid_set = new int[k + (2 * l_kmp)];
+    cudaMemcpy(h_centroid_set, d_centroid_set, (k + (2 * l_kmp)) * sizeof(int), cudaMemcpyDeviceToHost);
+    for (int i = 0; i < k; i++)
+    {
+        assign_centroids<<<(d + 255) / 256, 256>>>(d_data, d_centroids, d, i, h_centroid_set[i]);
+    }
+
+    /////// K-MEANS ////////////////////////////////////
+    int iter = 0;
+    for (; iter < max_iters; ++iter)
+    {
+        compute_distances<<<(N * k + 255) / 256, 256>>>(
+            d_data, d_centroids, d_distances, N, d, k);
+        cudaDeviceSynchronize();
+
+        if (iter % 2)
+        {
+            d_labels = d_labels_odd;
+        }
+        else
+        {
+            d_labels = d_labels_even;
+        }
+        assign_clusters<<<(N + 255) / 256, 256>>>(
+            d_distances, d_labels, d_min_distances, k, N, k);
+        cudaDeviceSynchronize();
+
+        cudaMemset(d_centroids, 0, k * d * sizeof(float));
+        cudaMemset(counts, 0, k * sizeof(int));
+        update_centroids<<<(N * d + 255) / 256, 256>>>(
+            d_data, d_labels, d_centroids, counts, N, d, k);
+
+        cudaDeviceSynchronize();
+
+        normalize_centroids<<<(k * d + 255) / 256, 256>>>(
+            d_centroids, counts, d, k);
+
+        cudaDeviceSynchronize();
+
+        cudaMemset(d_flag, 0, sizeof(int));
+        detect_change<<<((N + 255) / 256), 256>>>(
+            d_labels_even, d_labels_odd, N, d_flag);
+
+        int *flag = new int[1];
+        cudaMemcpy(flag, d_flag, sizeof(int), cudaMemcpyDeviceToHost);
+        if (!flag[0])
+            break;
+    }
+    // cout << "iterations " << iter << endl;
+
+    ////////////////////////////////////////////////////
+
+    vector<int> h_labels(N);
+    if (iter % 2)
+    {
+        d_labels = d_labels_odd;
+    }
+    else
+    {
+        d_labels = d_labels_even;
+    }
+    cudaMemcpy(h_labels.data(), d_labels, N * sizeof(int), cudaMemcpyDeviceToHost);
+
+    // freee
+    cudaFree(d_min_distances);
+    cudaFree(counts);
+    cudaFree(d_labels_odd);
+    cudaFree(d_labels_even);
+    cudaFree(d_labels);
+    cudaFree(d_flag);
+    cudaFree(d_data);
+    cudaFree(d_centroids);
+    cudaFree(d_distances);
+    cudaFree(d_probabs);
+    cudaFree(d_centroids);
+
+    for (int i = 0; i < N; ++i)
+        cout << h_labels[i] << " ";
+
+    cout << endl;
+    // cout << "iterations " << iter << endl;
+
+    return 0;
+}
