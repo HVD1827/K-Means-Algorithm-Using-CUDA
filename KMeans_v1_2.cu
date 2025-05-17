@@ -6,13 +6,7 @@
 #include <random>
 #include <numeric>
 #include <cuda_runtime.h>
-#include <thrust/device_vector.h>
-#include <thrust/host_vector.h>
-#include <thrust/reduce.h>
-#include <thrust/transform_reduce.h>
-#include <thrust/functional.h>
-#include <thrust/iterator/constant_iterator.h>
-#include <thrust/iterator/zip_iterator.h>
+
 
 using namespace std;
 
