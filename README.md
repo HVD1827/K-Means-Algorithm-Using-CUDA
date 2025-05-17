@@ -17,7 +17,10 @@ To cluster `N` d-dimensional points into `k` groups on the GPU by minimizing the
 - `v5`: Merged kernels and removed sequential bottlenecks via profiling (Nsight).
 - `v6`: Used **CUB library** for atomic-free reductions (prefix sum, reduce).
 - `v7`: Tried memory coalescing and CUDA streams.
-- `v8`: Final improvements and stabilization.
+- `v8`: version in progree, having improvements with mem coalescing
+
+The current best version is **v6**
+
 
 ### 🚀 Key CUDA Techniques
 - **CUB library**: Used `DeviceReduce`, `ReduceByKey` for lock-free centroid updates.
